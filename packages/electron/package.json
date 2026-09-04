@@ -1,0 +1,84 @@
+{
+  "name": "@candycapture/electron",
+  "version": "1.0.0",
+  "description": "CandyCapture Photography Invoice Application - Electron Desktop",
+  "author": "CandyCapture Photography",
+  "private": true,
+  "type": "module",
+  "main": "dist/main/main.js",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build -c electron.vite.config.ts",
+    "build:main-only": "electron-vite build -c electron-main.vite.config.ts",
+    "build:copy-web": "node scripts/copy-web-dist.js",
+    "build:full": "npm run build:main-only && npm run build:copy-web",
+    "build:win": "npm run build:full && electron-builder --win",
+    "build:win-portable": "npm run build:full && electron-builder --win portable",
+    "build:win-nsis": "npm run build:full && electron-builder --win nsis",
+    "build:all": "npm run build:full && electron-builder --win nsis --win portable",
+    "convert-icon": "node scripts/convert-icon.js",
+    "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
+    "lint:fix": "eslint . --ext ts,tsx --fix",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "clean": "rimraf dist release",
+    "prebuild:win": "npm run convert-icon"
+  },
+  "dependencies": {
+    "electron-updater": "^6.1.8"
+  },
+  "devDependencies": {
+    "@electron-toolkit/preload": "^3.0.0",
+    "@electron-toolkit/utils": "^3.0.0",
+    "@types/node": "^20.11.24",
+    "electron": "29.4.6",
+    "electron-builder": "^24.13.3",
+    "electron-vite": "^2.0.0",
+    "png-to-ico": "^3.0.2",
+    "rimraf": "^5.0.5",
+    "sharp": "^0.35.4",
+    "typescript": "^5.3.3",
+    "vite": "^5.1.6",
+    "vitest": "^1.3.1"
+  },
+  "build": {
+    "appId": "com.candycapture.photography",
+    "productName": "CandyCapture Photography",
+    "copyright": "Copyright © 2024 CandyCapture Photography",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64",
+            "ia32"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64",
+            "ia32"
+          ]
+        }
+      ],
+      "icon": "assets/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowElevation": true,
+      "allowToChangeInstallationDirectory": true,
+      "installerIcon": "assets/icon.ico",
+      "uninstallerIcon": "assets/icon.ico",
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "CandyCapture Photography"
+    }
+  }
+}

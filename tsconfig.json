@@ -1,0 +1,18 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@candycapture/web/*": ["packages/web/src/*"],
+      "@candycapture/electron/*": ["packages/electron/src/*"],
+      "@candycapture/backend/*": ["packages/backend/src/*"]
+    }
+  },
+  "references": [
+    { "path": "./packages/web" },
+    { "path": "./packages/electron" },
+    { "path": "./packages/backend" }
+  ],
+  "include": [],
+  "exclude": ["node_modules"]
+}
