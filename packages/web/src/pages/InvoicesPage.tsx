@@ -72,22 +72,88 @@ export function InvoicesPage({ initialStatusFilter }: InvoicesPageProps) {
   }, []);
 
   // Handle form submission (create/update)
+  // The new workflow creates/links customers automatically based on mobile number
   const handleSubmit = useCallback(
     async (formData: InvoiceFormData) => {
-      if (!formData.customer) {
-        showToast('Customer is required', 'error');
+      if (!formData.customerName || !formData.customerMobile) {
+        showToast('Customer name and mobile number are required', 'error');
         return;
       }
 
       setIsSubmitting(true);
       try {
         const isEditing = viewMode === 'edit' && selectedInvoice;
+        let customerId: string;
+
+        // Determine customer ID: use existing, find by mobile, or create new
+        if (formData.existingCustomerId) {
+          // User selected an existing customer from autocomplete
+          customerId = formData.existingCustomerId;
+
+          // If customer details were modified, update the customer record
+          const existingCustomer = await customerService.getCustomerById(customerId);
+          if (existingCustomer) {
+            const hasChanges =
+              existingCustomer.name !== formData.customerName ||
+              existingCustomer.email !== (formData.customerEmail || undefined) ||
+              existingCustomer.eventType !== formData.eventType ||
+              existingCustomer.eventDate !== formData.eventDate ||
+              existingCustomer.location !== formData.eventLocation;
+
+            if (hasChanges) {
+              await customerService.saveCustomer({
+                ...existingCustomer,
+                name: formData.customerName,
+                email: formData.customerEmail || undefined,
+                eventType: formData.eventType,
+                eventDate: formData.eventDate,
+                location: formData.eventLocation,
+              });
+            }
+          }
+        } else {
+          // No existing customer linked - search by mobile to prevent duplicates
+          const existingByMobile = await customerService.searchCustomers(formData.customerMobile);
+          const exactMobileMatch = existingByMobile.find(
+            (c) => c.mobile === formData.customerMobile
+          );
+
+          if (exactMobileMatch) {
+            // Found existing customer with same mobile - update and use
+            customerId = exactMobileMatch.id;
+            await customerService.saveCustomer({
+              ...exactMobileMatch,
+              name: formData.customerName,
+              email: formData.customerEmail || undefined,
+              eventType: formData.eventType,
+              eventDate: formData.eventDate,
+              location: formData.eventLocation,
+            });
+          } else {
+            // Create new customer
+            const newCustomer: Customer = {
+              id: crypto.randomUUID(),
+              name: formData.customerName,
+              mobile: formData.customerMobile,
+              email: formData.customerEmail || undefined,
+              eventType: formData.eventType,
+              eventDate: formData.eventDate,
+              location: formData.eventLocation,
+              invoiceCount: 0,
+              createdAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+              syncStatus: 'pending',
+            };
+            const savedCustomer = await customerService.saveCustomer(newCustomer);
+            customerId = savedCustomer.id;
+          }
+        }
 
         // Prepare invoice data
         const invoiceData: Invoice = {
           id: isEditing ? selectedInvoice.id : crypto.randomUUID(),
           invoiceNumber: formData.invoiceNumber,
-          customerId: formData.customer.id,
+          customerId: customerId,
           invoiceDate: formData.invoiceDate,
           dueDate: formData.dueDate,
           services: formData.services,
@@ -121,7 +187,7 @@ export function InvoicesPage({ initialStatusFilter }: InvoicesPageProps) {
         const savedInvoice = await saveInvoice(invoiceData);
 
         // Update customer invoice count
-        await customerService.updateCustomerInvoiceCount(formData.customer.id);
+        await customerService.updateCustomerInvoiceCount(customerId);
 
         showToast(
           `Invoice ${savedInvoice.invoiceNumber} has been ${isEditing ? 'updated' : 'created'}.`,

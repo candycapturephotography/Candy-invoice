@@ -1,8 +1,9 @@
 /**
  * InvoiceForm Component
  *
- * @description Main form component for creating and editing invoices.
- * Includes customer search, service selection, payment details, and auto-save draft.
+ * @description Main form component for creating invoices with integrated customer creation.
+ * The invoice page is the PRIMARY data entry point - customers are created automatically
+ * when generating an invoice if they don't already exist.
  *
  * @requirements 8.1 Invoice creation form with sections
  * @requirements 8.2 Request invoice number from server
@@ -17,8 +18,7 @@
  */
 
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
-import { Input, DatePicker, Modal, ConfirmModal, LoadingSpinner, useToast } from '../ui';
-import { CustomerSearch } from './CustomerSearch';
+import { Input, DatePicker, ConfirmModal, LoadingSpinner, useToast } from '../ui';
 import { ServiceSelector } from './ServiceSelector';
 import type { Customer, Invoice, InvoiceService } from '../../types';
 import { formatIndianCurrency } from '../../utils/currency';
@@ -31,15 +31,31 @@ import {
 import {
   validateAmount,
   validateAdvancePayment,
+  validateMobileNumber,
+  validateEmail,
 } from '../../utils/validation';
 import { calculatePaymentDetails } from '../../utils/payment';
 import { getSettings } from '../../services/settingsService';
 import { generateTempInvoiceNumber } from '../../services/invoiceService';
+import { customerService } from '../../services/customerService';
 import { cn } from '../../lib/utils';
 
+/**
+ * Form data structure for the new invoice workflow
+ * Contains all customer details inline - no pre-existing customer required
+ */
 export interface InvoiceFormData {
   invoiceNumber: string;
-  customer?: Customer;
+  // Customer details - entered directly, not requiring pre-existing customer
+  customerName: string;
+  customerMobile: string;
+  customerEmail?: string;
+  existingCustomerId?: string; // Set if an existing customer was selected
+  // Event details
+  eventType: string;
+  eventDate: string;
+  eventLocation: string;
+  // Invoice details
   invoiceDate: string;
   dueDate: string;
   services: InvoiceService[];
@@ -51,7 +67,7 @@ export interface InvoiceFormData {
 export interface InvoiceFormProps {
   /** Existing invoice for editing (undefined for new invoice) */
   invoice?: Invoice;
-  /** Customer to pre-fill for duplication */
+  /** Customer to pre-fill (for editing existing invoices) */
   prefillCustomer?: Customer;
   /** Callback when form is submitted */
   onSubmit: (data: InvoiceFormData) => Promise<void>;
@@ -64,12 +80,22 @@ export interface InvoiceFormProps {
 }
 
 interface FormErrors {
-  customer?: string;
+  customerName?: string;
+  customerMobile?: string;
+  customerEmail?: string;
+  eventType?: string;
+  eventDate?: string;
+  eventLocation?: string;
   invoiceDate?: string;
   dueDate?: string;
   services?: string;
   totalAmount?: string;
   advancePaid?: string;
+}
+
+interface CustomerSearchResult {
+  customer: Customer;
+  matchType: 'name' | 'mobile';
 }
 
 // Draft storage key
@@ -83,6 +109,18 @@ interface StoredDraft {
   invoiceId?: string;
 }
 
+// Common event types for quick selection
+const COMMON_EVENT_TYPES = [
+  'Wedding',
+  'Birthday',
+  'Reception',
+  'Engagement',
+  'Baby Shower',
+  'Corporate Event',
+  'Anniversary',
+  'Other',
+];
+
 export function InvoiceForm({
   invoice,
   prefillCustomer,
@@ -93,17 +131,24 @@ export function InvoiceForm({
 }: InvoiceFormProps) {
   const { showToast } = useToast();
   const isEditMode = !!invoice;
-  
+
   // Date range for validation
   const dateRange = useMemo(() => getInvoiceDateRange(), []);
 
   // Form state
   const [formData, setFormData] = useState<InvoiceFormData>(() => {
-    if (invoice) {
-      // Edit mode: populate from existing invoice
+    const today = getTodayISO();
+    if (invoice && prefillCustomer) {
+      // Edit mode: populate from existing invoice and customer
       return {
         invoiceNumber: invoice.invoiceNumber,
-        customer: undefined, // Will be loaded separately
+        customerName: prefillCustomer.name,
+        customerMobile: prefillCustomer.mobile,
+        customerEmail: prefillCustomer.email,
+        existingCustomerId: prefillCustomer.id,
+        eventType: prefillCustomer.eventType,
+        eventDate: prefillCustomer.eventDate,
+        eventLocation: prefillCustomer.location,
         invoiceDate: invoice.invoiceDate,
         dueDate: invoice.dueDate,
         services: invoice.services,
@@ -113,10 +158,15 @@ export function InvoiceForm({
       };
     }
     // New invoice defaults
-    const today = getTodayISO();
     return {
       invoiceNumber: '',
-      customer: prefillCustomer,
+      customerName: '',
+      customerMobile: '',
+      customerEmail: '',
+      existingCustomerId: undefined,
+      eventType: '',
+      eventDate: today,
+      eventLocation: '',
       invoiceDate: today,
       dueDate: calculateDueDate(today),
       services: [],
@@ -130,8 +180,14 @@ export function InvoiceForm({
   const [isLoadingNumber, setIsLoadingNumber] = useState(!isEditMode);
   const [showDraftModal, setShowDraftModal] = useState(false);
   const [savedDraft, setSavedDraft] = useState<StoredDraft | null>(null);
-  const [showCustomerModal, setShowCustomerModal] = useState(false);
-  const [newCustomerName, setNewCustomerName] = useState('');
+
+  // Customer search state
+  const [customerSearchResults, setCustomerSearchResults] = useState<CustomerSearchResult[]>([]);
+  const [isSearchingCustomers, setIsSearchingCustomers] = useState(false);
+  const [showCustomerDropdown, setShowCustomerDropdown] = useState(false);
+  const [focusedSearchIndex, setFocusedSearchIndex] = useState(-1);
+  const searchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const customerSearchRef = useRef<HTMLDivElement>(null);
 
   // Refs for auto-save
   const autoSaveTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -188,7 +244,7 @@ export function InvoiceForm({
     };
 
     requestNumber();
-  }, [isEditMode, onRequestInvoiceNumber, showToast]);
+  }, [isEditMode, onRequestInvoiceNumber, showToast, formData.invoiceNumber]);
 
   // Check for existing draft on mount
   useEffect(() => {
@@ -241,6 +297,21 @@ export function InvoiceForm({
     };
   }, [formData, isEditMode]);
 
+  // Close customer dropdown when clicking outside
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (
+        customerSearchRef.current &&
+        !customerSearchRef.current.contains(event.target as Node)
+      ) {
+        setShowCustomerDropdown(false);
+      }
+    };
+
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
+
   // Handle draft restore
   const handleRestoreDraft = useCallback(() => {
     if (savedDraft) {
@@ -255,6 +326,137 @@ export function InvoiceForm({
     localStorage.removeItem(DRAFT_STORAGE_KEY);
     setShowDraftModal(false);
   }, []);
+
+  // Search customers by name or mobile
+  const searchCustomers = useCallback(async (query: string) => {
+    if (query.trim().length < 2) {
+      setCustomerSearchResults([]);
+      setShowCustomerDropdown(false);
+      return;
+    }
+
+    setIsSearchingCustomers(true);
+    try {
+      const customers = await customerService.searchCustomers(query);
+      const results: CustomerSearchResult[] = customers.map((customer) => ({
+        customer,
+        matchType: customer.mobile.includes(query) ? 'mobile' : 'name',
+      }));
+      setCustomerSearchResults(results);
+      setShowCustomerDropdown(results.length > 0);
+      setFocusedSearchIndex(-1);
+    } catch (error) {
+      console.error('Customer search failed:', error);
+      setCustomerSearchResults([]);
+    } finally {
+      setIsSearchingCustomers(false);
+    }
+  }, []);
+
+  // Handle customer name input change with debounced search
+  const handleCustomerNameChange = useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      const value = e.target.value;
+      setFormData((prev) => ({
+        ...prev,
+        customerName: value,
+        existingCustomerId: undefined, // Clear existing customer link when typing
+      }));
+      setErrors((prev) => ({ ...prev, customerName: undefined }));
+
+      // Clear pending search
+      if (searchTimeoutRef.current) {
+        clearTimeout(searchTimeoutRef.current);
+      }
+
+      // Debounce search
+      searchTimeoutRef.current = setTimeout(() => {
+        searchCustomers(value);
+      }, 300);
+    },
+    [searchCustomers]
+  );
+
+  // Handle mobile input change with debounced search
+  const handleMobileChange = useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      const value = e.target.value.replace(/\D/g, '').slice(0, 10); // Only digits, max 10
+      setFormData((prev) => ({
+        ...prev,
+        customerMobile: value,
+        existingCustomerId: undefined, // Clear existing customer link when typing
+      }));
+      setErrors((prev) => ({ ...prev, customerMobile: undefined }));
+
+      // Clear pending search
+      if (searchTimeoutRef.current) {
+        clearTimeout(searchTimeoutRef.current);
+      }
+
+      // Debounce search by mobile
+      searchTimeoutRef.current = setTimeout(() => {
+        searchCustomers(value);
+      }, 300);
+    },
+    [searchCustomers]
+  );
+
+  // Handle selecting an existing customer from search results
+  const handleSelectCustomer = useCallback((customer: Customer) => {
+    setFormData((prev) => ({
+      ...prev,
+      customerName: customer.name,
+      customerMobile: customer.mobile,
+      customerEmail: customer.email || '',
+      existingCustomerId: customer.id,
+      eventType: customer.eventType,
+      eventDate: customer.eventDate,
+      eventLocation: customer.location,
+    }));
+    setShowCustomerDropdown(false);
+    setCustomerSearchResults([]);
+    setErrors((prev) => ({
+      ...prev,
+      customerName: undefined,
+      customerMobile: undefined,
+      eventType: undefined,
+      eventDate: undefined,
+      eventLocation: undefined,
+    }));
+  }, []);
+
+  // Handle keyboard navigation in customer search
+  const handleCustomerSearchKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      if (!showCustomerDropdown) return;
+
+      switch (e.key) {
+        case 'ArrowDown':
+          e.preventDefault();
+          setFocusedSearchIndex((prev) =>
+            prev < customerSearchResults.length - 1 ? prev + 1 : 0
+          );
+          break;
+        case 'ArrowUp':
+          e.preventDefault();
+          setFocusedSearchIndex((prev) =>
+            prev > 0 ? prev - 1 : customerSearchResults.length - 1
+          );
+          break;
+        case 'Enter':
+          e.preventDefault();
+          if (focusedSearchIndex >= 0 && focusedSearchIndex < customerSearchResults.length) {
+            handleSelectCustomer(customerSearchResults[focusedSearchIndex]!.customer);
+          }
+          break;
+        case 'Escape':
+          setShowCustomerDropdown(false);
+          setFocusedSearchIndex(-1);
+          break;
+      }
+    },
+    [showCustomerDropdown, customerSearchResults, focusedSearchIndex, handleSelectCustomer]
+  );
 
   // Update due date when invoice date changes (only for new invoices)
   const handleInvoiceDateChange = useCallback(
@@ -291,25 +493,46 @@ export function InvoiceForm({
     [handleFieldChange]
   );
 
-  // Handle customer selection
-  const handleCustomerSelect = useCallback((customer: Customer | undefined) => {
-    setFormData((prev) => ({ ...prev, customer }));
-    setErrors((prev) => ({ ...prev, customer: undefined }));
-  }, []);
-
-  // Handle create new customer request
-  const handleCreateNewCustomer = useCallback((searchQuery: string) => {
-    setNewCustomerName(searchQuery);
-    setShowCustomerModal(true);
-  }, []);
-
   // Validate form
   const validateForm = useCallback((): boolean => {
     const newErrors: FormErrors = {};
 
-    // Customer required
-    if (!formData.customer) {
-      newErrors.customer = 'Please select or create a customer';
+    // Customer name required
+    if (!formData.customerName.trim()) {
+      newErrors.customerName = 'Customer name is required';
+    }
+
+    // Mobile number validation
+    if (!formData.customerMobile) {
+      newErrors.customerMobile = 'Mobile number is required';
+    } else {
+      const mobileValidation = validateMobileNumber(formData.customerMobile);
+      if (!mobileValidation.valid) {
+        newErrors.customerMobile = mobileValidation.error;
+      }
+    }
+
+    // Email validation (optional but must be valid if provided)
+    if (formData.customerEmail) {
+      const emailValidation = validateEmail(formData.customerEmail);
+      if (!emailValidation.valid) {
+        newErrors.customerEmail = emailValidation.error;
+      }
+    }
+
+    // Event type required
+    if (!formData.eventType.trim()) {
+      newErrors.eventType = 'Event type is required';
+    }
+
+    // Event date required
+    if (!formData.eventDate) {
+      newErrors.eventDate = 'Event date is required';
+    }
+
+    // Event location required
+    if (!formData.eventLocation.trim()) {
+      newErrors.eventLocation = 'Event location is required';
     }
 
     // Invoice date validation
@@ -340,7 +563,10 @@ export function InvoiceForm({
     }
 
     // Advance payment validation
-    const advanceValidation = validateAdvancePayment(formData.advancePaid, formData.totalAmount);
+    const advanceValidation = validateAdvancePayment(
+      formData.advancePaid,
+      formData.totalAmount
+    );
     if (!advanceValidation.valid) {
       newErrors.advancePaid = advanceValidation.error;
     }
@@ -355,7 +581,7 @@ export function InvoiceForm({
       e.preventDefault();
 
       if (!validateForm()) {
-        showToast('Please fix the errors before saving.', 'error');
+        showToast('Please fix the errors before generating the invoice.', 'error');
         return;
       }
 
@@ -364,12 +590,17 @@ export function InvoiceForm({
         // Clear draft on successful save
         localStorage.removeItem(DRAFT_STORAGE_KEY);
       } catch (error) {
-        console.error('Failed to save invoice:', error);
-        showToast('Failed to save invoice. Please try again.', 'error');
+        console.error('Failed to generate invoice:', error);
+        showToast('Failed to generate invoice. Please try again.', 'error');
       }
     },
     [formData, validateForm, onSubmit, showToast]
   );
+
+  // Clear linked customer when editing customer fields manually
+  const handleClearLinkedCustomer = useCallback(() => {
+    setFormData((prev) => ({ ...prev, existingCustomerId: undefined }));
+  }, []);
 
   return (
     <>
@@ -387,9 +618,7 @@ export function InvoiceForm({
               value={formData.invoiceNumber}
               disabled
               fullWidth
-              rightIcon={
-                isLoadingNumber ? <LoadingSpinner size="sm" /> : undefined
-              }
+              rightIcon={isLoadingNumber ? <LoadingSpinner size="sm" /> : undefined}
             />
 
             {/* Invoice Date */}
@@ -418,30 +647,167 @@ export function InvoiceForm({
           </div>
         </div>
 
-        {/* Customer Section */}
+        {/* Customer Section - Inline entry with autocomplete */}
         <div className="bg-white rounded-lg border border-surface-200 p-6">
-          <h3 className="text-lg font-semibold text-surface-900 mb-4">Customer Details</h3>
-          <CustomerSearch
-            selectedCustomer={formData.customer}
-            onSelect={handleCustomerSelect}
-            onCreateNew={handleCreateNewCustomer}
-            error={errors.customer}
-            required
-          />
+          <div className="flex items-center justify-between mb-4">
+            <h3 className="text-lg font-semibold text-surface-900">Customer Details</h3>
+            {formData.existingCustomerId && (
+              <span className="text-sm text-primary-600 bg-primary-50 px-2 py-1 rounded">
+                Linked to existing customer
+              </span>
+            )}
+          </div>
 
-          {/* Display customer details if selected */}
-          {formData.customer && (
-            <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
-              <div>
-                <span className="text-surface-500">Event:</span>{' '}
-                <span className="text-surface-900">{formData.customer.eventType}</span>
-              </div>
-              <div>
-                <span className="text-surface-500">Location:</span>{' '}
-                <span className="text-surface-900">{formData.customer.location}</span>
-              </div>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            {/* Customer Name with autocomplete */}
+            <div ref={customerSearchRef} className="relative">
+              <Input
+                label="Customer Name"
+                value={formData.customerName}
+                onChange={handleCustomerNameChange}
+                onKeyDown={handleCustomerSearchKeyDown}
+                onFocus={() => {
+                  if (customerSearchResults.length > 0) {
+                    setShowCustomerDropdown(true);
+                  }
+                }}
+                error={errors.customerName}
+                required
+                fullWidth
+                placeholder="Search or enter new name..."
+                autoComplete="off"
+                rightIcon={isSearchingCustomers ? <LoadingSpinner size="sm" /> : undefined}
+              />
+
+              {/* Customer search dropdown */}
+              {showCustomerDropdown && customerSearchResults.length > 0 && (
+                <ul
+                  role="listbox"
+                  className="absolute z-20 w-full mt-1 max-h-48 overflow-auto bg-white border border-surface-200 rounded-md shadow-lg"
+                >
+                  {customerSearchResults.map((result, index) => (
+                    <li
+                      key={result.customer.id}
+                      role="option"
+                      aria-selected={focusedSearchIndex === index}
+                      onClick={() => handleSelectCustomer(result.customer)}
+                      onMouseEnter={() => setFocusedSearchIndex(index)}
+                      className={cn(
+                        'px-3 py-2 cursor-pointer transition-colors',
+                        focusedSearchIndex === index
+                          ? 'bg-primary-50 text-primary-900'
+                          : 'hover:bg-surface-50'
+                      )}
+                    >
+                      <p className="font-medium text-surface-900">
+                        {result.customer.name}
+                      </p>
+                      <p className="text-sm text-surface-600">
+                        {result.customer.mobile} • {result.customer.eventType} •{' '}
+                        {result.customer.location}
+                      </p>
+                    </li>
+                  ))}
+                </ul>
+              )}
             </div>
-          )}
+
+            {/* Mobile Number */}
+            <Input
+              label="Mobile Number"
+              value={formData.customerMobile}
+              onChange={handleMobileChange}
+              onKeyDown={handleCustomerSearchKeyDown}
+              error={errors.customerMobile}
+              required
+              fullWidth
+              placeholder="10-digit mobile number"
+              maxLength={10}
+              inputMode="numeric"
+            />
+
+            {/* Email (Optional) */}
+            <Input
+              label="Email"
+              type="email"
+              value={formData.customerEmail || ''}
+              onChange={(e) => {
+                handleFieldChange('customerEmail', e.target.value);
+                handleClearLinkedCustomer();
+              }}
+              error={errors.customerEmail}
+              fullWidth
+              placeholder="Optional"
+            />
+          </div>
+        </div>
+
+        {/* Event Section */}
+        <div className="bg-white rounded-lg border border-surface-200 p-6">
+          <h3 className="text-lg font-semibold text-surface-900 mb-4">Event Details</h3>
+
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            {/* Event Type */}
+            <div className="flex flex-col gap-1.5">
+              <label className="text-sm font-medium text-surface-700">
+                Event Type <span className="text-red-500">*</span>
+              </label>
+              <div className="relative">
+                <input
+                  list="event-types"
+                  value={formData.eventType}
+                  onChange={(e) => {
+                    handleFieldChange('eventType', e.target.value);
+                    handleClearLinkedCustomer();
+                  }}
+                  className={cn(
+                    'w-full px-3 py-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-primary-500',
+                    errors.eventType
+                      ? 'border-red-500'
+                      : 'border-surface-300'
+                  )}
+                  placeholder="e.g., Wedding, Birthday"
+                />
+                <datalist id="event-types">
+                  {COMMON_EVENT_TYPES.map((type) => (
+                    <option key={type} value={type} />
+                  ))}
+                </datalist>
+              </div>
+              {errors.eventType && (
+                <p className="text-sm text-red-600" role="alert">
+                  {errors.eventType}
+                </p>
+              )}
+            </div>
+
+            {/* Event Date */}
+            <DatePicker
+              label="Event Date"
+              value={formData.eventDate}
+              onChange={(e) => {
+                handleFieldChange('eventDate', e.target.value);
+                handleClearLinkedCustomer();
+              }}
+              error={errors.eventDate}
+              required
+              fullWidth
+            />
+
+            {/* Event Location */}
+            <Input
+              label="Event Location"
+              value={formData.eventLocation}
+              onChange={(e) => {
+                handleFieldChange('eventLocation', e.target.value);
+                handleClearLinkedCustomer();
+              }}
+              error={errors.eventLocation}
+              required
+              fullWidth
+              placeholder="e.g., Sivakasi, Chennai"
+            />
+          </div>
         </div>
 
         {/* Services Section */}
@@ -461,7 +827,7 @@ export function InvoiceForm({
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             {/* Total Amount */}
             <Input
-              label="Total Amount"
+              label="Total Package Amount"
               type="number"
               step="0.01"
               min="0.01"
@@ -546,7 +912,7 @@ export function InvoiceForm({
             className="px-6 py-2 text-white bg-primary-500 rounded-md hover:bg-primary-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
           >
             {isSubmitting && <LoadingSpinner size="sm" />}
-            {isEditMode ? 'Update Invoice' : 'Create Invoice'}
+            {isEditMode ? 'Update Invoice' : 'Generate Invoice'}
           </button>
         </div>
       </form>
@@ -562,27 +928,6 @@ export function InvoiceForm({
         cancelText="Discard"
         variant="primary"
       />
-
-      {/* Create Customer Modal - placeholder for integration */}
-      <Modal
-        isOpen={showCustomerModal}
-        onClose={() => setShowCustomerModal(false)}
-        title="Create New Customer"
-        size="md"
-      >
-        <p className="text-surface-600">
-          To create a new customer "{newCustomerName}", please use the Customers page.
-        </p>
-        <div className="mt-4 flex justify-end">
-          <button
-            type="button"
-            onClick={() => setShowCustomerModal(false)}
-            className="px-4 py-2 text-surface-700 bg-surface-100 rounded-md hover:bg-surface-200 transition-colors"
-          >
-            Close
-          </button>
-        </div>
-      </Modal>
     </>
   );
 }
